@@ -1,4 +1,4 @@
-import { getExternalStyleSheets, getExternalScripts } from "./entry";
+import { getExternalStyleSheets, getExternalScripts, ScriptResultList } from "./entry";
 import {
   getWujieById,
   rawAppendChild,
@@ -252,7 +252,45 @@ function rewriteAppendOrInsertChild(opts: {
               crossoriginType: crossOrigin || "",
               ignore: isMatchUrl(src, getEffectLoaders("jsIgnores", plugins)),
             } as ScriptObject;
-            getExternalScripts([scriptOptions], fetch, lifecycles.loadError, fiber).forEach((scriptResult) =>
+            let scriptResultList = getExternalScripts([scriptOptions], fetch, lifecycles.loadError, fiber);
+            // 同步代码
+            const syncScriptResultList: ScriptResultList = [];
+            const asyncScriptResultList: ScriptResultList = [];
+            scriptResultList.forEach((scriptResult) => {
+              if (!scriptResult.defer && !scriptResult.async) {
+                syncScriptResultList.push(scriptResult);
+              } else {
+                asyncScriptResultList.push(scriptResult);
+              }
+            });
+            syncScriptResultList.forEach((scriptResult) => {
+              if (sandbox.execQueue === null) return warn(WUJIE_TIPS_REPEAT_RENDER);
+              const execQueueLength = sandbox.execQueue?.length;
+              sandbox.execQueue.push(() =>
+                scriptResult.contentPromise.then(
+                  (content) =>
+                    fiber
+                      ? requestIdleCallback(() => {
+                          execScript({ ...scriptResult, content });
+                        })
+                      : execScript({ ...scriptResult, content }),
+                  () => {
+                    manualInvokeElementEvent(element, "error");
+                    element = null;
+                  }
+                )
+              );
+              // 同步脚本如果都执行完了，需要手动触发执行
+              if (!execQueueLength) {
+                // 避免因为每次都是单独添加script，但因为队列为空需要手动触发，刚添加的任务会被移除并执行，这样也导致所有的append都会立即执行
+                // 通过添加一个占位任务到执行队列可以避免
+                sandbox.execQueue.push(() =>
+                  insertScriptToIframe({ content: `` }, sandbox.iframe.contentWindow, element)
+                );
+                sandbox.execQueue.shift()?.();
+              }
+            });
+            asyncScriptResultList.forEach((scriptResult) =>
               scriptResult.contentPromise.then(
                 (content) => {
                   if (sandbox.execQueue === null) return warn(WUJIE_TIPS_REPEAT_RENDER);
